@@ -49,13 +49,18 @@ a job in two places or in none.
 
 | Script | Effect |
 |---|---|
-| `enqueue` | optional `SET idem NX PX`, then `XADD` (or `ZADD` to delayed using server `TIME`). A duplicate key returns the original job id. |
-| `promote` | server `TIME`; `ZRANGEBYSCORE ... LIMIT`, `ZREM`, `XADD` for each due member. A `ZREM` and its `XADD` are in the same script, so concurrent promoters cannot duplicate a job. |
-| `retry` | `XACK` the original; only if that returned 1, `ZADD` the next attempt to delayed at `TIME + backoff`, then `XDEL`. |
-| `dead` | `XACK` the original; only if that returned 1, `XADD` to dead with error fields, then `XDEL`. |
-| `requeue` | read a dead entry, `XADD` it to the stream with `attempt=1`, `XDEL` it from dead. |
+| `enqueue` | return the existing id if the idempotency marker exists; else `XADD` (or `ZADD` to delayed using server `TIME`), then write the marker with `SET PX`. |
+| `promote` | server `TIME`; `ZRANGEBYSCORE ... LIMIT`; for each member `XADD` to the stream (or to dead if undecodable), *then* `ZREM`. The whole script is atomic, so concurrent promoters cannot duplicate a job. |
+| `retry` | if the entry is still in the PEL: `ZADD` the next attempt to delayed at `TIME + backoff`, then `XACK` + `XDEL` the original. |
+| `dead` | if the entry is still in the PEL: `XADD` to dead with error fields, then `XACK` + `XDEL`. |
+| `requeue` | read a dead entry, `XADD` it to the stream with `attempt=1`, then `XDEL` it from dead. |
 
-Gating on the `XACK` result makes retry/dead idempotent when two consumers race
+**Write ordering.** Redis does not roll back a script that fails part-way (for
+example on OOM). Each script therefore writes a job's new home before removing its
+old one, and the idempotency marker last. A mid-script failure can at worst duplicate
+a job, which at-least-once delivery allows, and can never lose one.
+
+Checking that the entry is still pending makes retry/dead idempotent when two consumers race
 for the same entry (for example after a slow handler was reclaimed).
 
 ## 5. State machine
@@ -134,5 +139,5 @@ Ambiguities resolved with the most conservative interpretation:
     (redis-py raises `MaxConnectionsError` when a non-blocking pool is exhausted).
 17. **Malformed delayed members** (undecodable JSON) are moved to the dead stream with
     `error_type=MalformedJob` by the promoter rather than blocking promotion.
-18. **Retry/dead-letter are gated on the `XACK` result**, so a consumer that lost its
+18. **Retry/dead-letter only act on entries still in the PEL**, so a consumer that lost its
     entry (reclaimed after a stall) cannot also reschedule it.

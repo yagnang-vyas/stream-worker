@@ -123,7 +123,7 @@ class Worker:
         return self._running
 
     def stop(self) -> None:
-        """Request a graceful shutdown. Safe to call from signal handlers."""
+        """Request a graceful shutdown. Call it from the worker's event-loop thread."""
         self._stop.set()
 
     async def run(self, *, handle_signals: bool = False) -> None:

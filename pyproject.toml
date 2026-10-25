@@ -41,7 +41,7 @@ packages = ["src/streamworker"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-markers = ["integration: requires a real Redis server"]
+filterwarnings = ["error"]
 
 [tool.coverage.run]
 branch = true
