@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import secrets
+import signal
 import socket
 from collections.abc import Callable, Mapping
 from datetime import timedelta
@@ -23,6 +24,8 @@ logger = logging.getLogger("streamworker")
 
 _ERROR_PAUSE = 1.0
 _PROMOTE_BATCH = 100
+_RECOVER_BATCH = 10
+_MAX_RECOVERY_INTERVAL = 5.0
 
 
 def _seconds(td: timedelta) -> float:
@@ -61,6 +64,7 @@ class Worker:
         shutdown_grace: timedelta = timedelta(seconds=30),
         poll_interval: timedelta = timedelta(seconds=1),
         promote_interval: timedelta = timedelta(seconds=1),
+        recovery_interval: timedelta | None = None,
     ) -> None:
         if concurrency < 1:
             raise ConfigError("concurrency must be at least 1")
@@ -72,6 +76,8 @@ class Worker:
             raise ConfigError("shutdown_grace must not be negative")
         if _seconds(poll_interval) <= 0 or _seconds(promote_interval) <= 0:
             raise ConfigError("poll_interval and promote_interval must be positive")
+        if recovery_interval is not None and _seconds(recovery_interval) <= 0:
+            raise ConfigError("recovery_interval must be positive")
         for name, handler in handlers.items():
             if not callable(handler):
                 raise ConfigError(f"handler for {name!r} is not callable")
@@ -85,10 +91,13 @@ class Worker:
         self.shutdown_grace = shutdown_grace
         self.poll_interval = poll_interval
         self.promote_interval = promote_interval
+        self.recovery_interval = recovery_interval or timedelta(
+            seconds=min(_seconds(visibility_timeout) / 2, _MAX_RECOVERY_INTERVAL)
+        )
         self.consumer = f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(2)}"
         self._slots = asyncio.Semaphore(concurrency)
         self._stop = asyncio.Event()
-        self._inflight: set[asyncio.Task[None]] = set()
+        self._inflight: dict[asyncio.Task[None], str] = {}
         self._running = False
 
     # -- lifecycle ------------------------------------------------------------
@@ -98,21 +107,33 @@ class Worker:
         """Number of jobs currently executing."""
         return len(self._inflight)
 
+    @property
+    def running(self) -> bool:
+        """Whether :meth:`run` is active."""
+        return self._running
+
     def stop(self) -> None:
         """Request a graceful shutdown. Safe to call from signal handlers."""
         self._stop.set()
 
-    async def run(self) -> None:
-        """Process jobs until :meth:`stop` is called, then drain and return."""
+    async def run(self, *, handle_signals: bool = False) -> None:
+        """Process jobs until :meth:`stop` is called, then drain and return.
+
+        With ``handle_signals``, SIGTERM and SIGINT trigger :meth:`stop`.
+        On shutdown, in-flight jobs get ``shutdown_grace`` to finish; the rest are
+        cancelled and stay pending, to be recovered by a worker later.
+        """
         if self._running:
             raise RuntimeError("worker is already running")
         self._running = True
         loops: list[asyncio.Task[None]] = []
+        installed = self._install_signal_handlers() if handle_signals else []
         try:
             await self.queue.ensure_group()
             loops = [
                 asyncio.create_task(self._supervised(self._read_loop), name="sw-reader"),
                 asyncio.create_task(self._supervised(self._promote_loop), name="sw-promoter"),
+                asyncio.create_task(self._supervised(self._recovery_loop), name="sw-recovery"),
             ]
             await self._stop.wait()
             await self._drain(loops)
@@ -121,7 +142,21 @@ class Worker:
             await self._cancel(*loops, *self._inflight)
             raise
         finally:
+            loop = asyncio.get_running_loop()
+            for sig in installed:
+                loop.remove_signal_handler(sig)
             self._running = False
+
+    def _install_signal_handlers(self) -> list[signal.Signals]:
+        loop = asyncio.get_running_loop()
+        installed: list[signal.Signals] = []
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, self.stop)
+            except NotImplementedError:  # pragma: no cover - e.g. Windows
+                break
+            installed.append(sig)
+        return installed
 
     async def _drain(self, loops: list[asyncio.Task[None]]) -> None:
         deadline = asyncio.get_running_loop().time() + _seconds(self.shutdown_grace)
@@ -134,7 +169,7 @@ class Worker:
             _, stuck = await asyncio.wait(loops, timeout=remaining())
             await self._cancel(*stuck)
         if self._inflight:
-            _, unfinished = await asyncio.wait(set(self._inflight), timeout=remaining())
+            _, unfinished = await asyncio.wait(list(self._inflight), timeout=remaining())
             if unfinished:
                 logger.warning(
                     "shutdown grace expired; %d job(s) left pending for recovery", len(unfinished)
@@ -185,11 +220,11 @@ class Worker:
     def _spawn(self, entry_id: str, fields: dict[str, str]) -> None:
         """Start a job. The caller must hold one slot, released when the job ends."""
         task = asyncio.create_task(self._run_job(entry_id, fields), name=f"sw-job-{entry_id}")
-        self._inflight.add(task)
+        self._inflight[task] = entry_id
         task.add_done_callback(self._job_done)
 
     def _job_done(self, task: asyncio.Task[None]) -> None:
-        self._inflight.discard(task)
+        self._inflight.pop(task, None)
         self._slots.release()
 
     # -- loops -----------------------------------------------------------------
@@ -215,6 +250,84 @@ class Worker:
                         used += 1
             finally:
                 self._release(got - used)
+
+    async def _recovery_loop(self) -> None:
+        while not self._stop.is_set():
+            await self._recover_once()
+            await self._sleep(_seconds(self.recovery_interval))
+
+    async def _recover_once(self) -> None:
+        """Take over entries pending longer than the visibility timeout (crashed workers)."""
+        redis = self.queue.redis
+        min_idle_ms = int(_seconds(self.visibility_timeout) * 1000)
+        start = "0-0"
+        while not self._stop.is_set():
+            got = await self._reserve(
+                min(self.concurrency, _RECOVER_BATCH), _seconds(self.recovery_interval)
+            )
+            if not got:
+                return
+            used = 0
+            try:
+                result: list[Any] = await redis.xautoclaim(
+                    self.queue.keys.stream,
+                    self.queue.group,
+                    self.consumer,
+                    min_idle_time=min_idle_ms,
+                    start_id=start,
+                    count=got,
+                )
+                next_start, entries = result[0], result[1]
+                deleted = result[2] if len(result) > 2 else []
+                if deleted:
+                    logger.warning(
+                        "recovery: %d pending entr(ies) had been deleted from the stream",
+                        len(deleted),
+                    )
+                for entry_id, fields in entries:
+                    if await self._recover_entry(entry_id, fields):
+                        used += 1
+            finally:
+                self._release(got - used)
+            if next_start == "0-0":
+                return
+            start = next_start
+
+    async def _recover_entry(self, entry_id: str, fields: dict[str, str] | None) -> bool:
+        """Dead-letter a poison entry or start it again. Returns True if a job was started."""
+        queue = self.queue
+        if not fields:  # deleted entry (Redis < 7.0 reports these as empty)
+            await queue.redis.xack(queue.keys.stream, queue.group, entry_id)
+            return False
+        if entry_id in self._inflight.values():
+            return False
+        rows = await queue.redis.xpending_range(
+            queue.keys.stream, queue.group, min=entry_id, max=entry_id, count=1
+        )
+        if not rows:  # acknowledged by someone else in the meantime
+            return False
+        deliveries = int(rows[0]["times_delivered"])
+        try:
+            max_attempts = int(fields["max_attempts"])
+        except (KeyError, ValueError):
+            max_attempts = None  # malformed; _process dead-letters it
+        if max_attempts is not None and deliveries > max_attempts:
+            logger.warning(
+                "job %s: delivered %d times (max %d); dead-lettering as poison",
+                fields.get("id", entry_id),
+                deliveries,
+                max_attempts,
+            )
+            await queue.move_to_dead(
+                entry_id,
+                fields,
+                "MaxDeliveriesExceeded",
+                f"delivered {deliveries} times without being acknowledged",
+            )
+            return False
+        logger.info("job %s: recovered from a stalled worker", fields.get("id", entry_id))
+        self._spawn(entry_id, fields)
+        return True
 
     async def _promote_loop(self) -> None:
         while not self._stop.is_set():
