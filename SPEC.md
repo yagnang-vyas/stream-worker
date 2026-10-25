@@ -126,3 +126,13 @@ Ambiguities resolved with the most conservative interpretation:
 12. **Idempotency keys expire** after `idempotency_ttl` (default 24 h); after
     that the same key enqueues a new job.
 13. **Worker does not close the Redis client**; the caller (or CLI) owns it.
+14. **`dead purge` and `dead requeue` require `--id` or `--all`** so a bare command
+    cannot delete or move everything.
+15. **Dead-letter entry ids are validated** (`<ms>-<seq>`) before use; invalid ids are
+    rejected with `ConfigError` (CLI exit 2, admin API 422).
+16. **A Redis pool smaller than `concurrency + 4`** logs a warning at `Worker` creation
+    (redis-py raises `MaxConnectionsError` when a non-blocking pool is exhausted).
+17. **Malformed delayed members** (undecodable JSON) are moved to the dead stream with
+    `error_type=MalformedJob` by the promoter rather than blocking promotion.
+18. **Retry/dead-letter are gated on the `XACK` result**, so a consumer that lost its
+    entry (reclaimed after a stall) cannot also reschedule it.

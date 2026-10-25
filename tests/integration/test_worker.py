@@ -360,3 +360,19 @@ async def test_uninspectable_and_noncallable_handlers(queue: Queue) -> None:
     with pytest.raises(ConfigError):
         Worker(queue, {"t": "nope"})  # type: ignore[dict-item]
     Worker(queue, {"t": print})  # builtin with a signature; just constructs
+
+
+async def test_small_connection_pool_is_warned_about(
+    redis: Any, queue_name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    import redis.asyncio as aioredis
+
+    from tests.conftest import REDIS_URL
+
+    small = aioredis.from_url(REDIS_URL, decode_responses=True, max_connections=5)
+    try:
+        caplog.set_level(logging.WARNING, logger="streamworker")
+        Worker(Queue(small, queue_name), {}, concurrency=10)
+        assert "raise max_connections" in caplog.text
+    finally:
+        await small.aclose()

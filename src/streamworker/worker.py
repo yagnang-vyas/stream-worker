@@ -25,6 +25,7 @@ logger = logging.getLogger("streamworker")
 _ERROR_PAUSE = 1.0
 _PROMOTE_BATCH = 100
 _RECOVER_BATCH = 10
+_CONNECTIONS_OVERHEAD = 4  # blocked reader, promoter, recovery, spare
 _MAX_RECOVERY_INTERVAL = 5.0
 
 
@@ -81,6 +82,15 @@ class Worker:
         for name, handler in handlers.items():
             if not callable(handler):
                 raise ConfigError(f"handler for {name!r} is not callable")
+        pool_size = getattr(queue.redis.connection_pool, "max_connections", None)
+        if isinstance(pool_size, int) and pool_size < concurrency + _CONNECTIONS_OVERHEAD:
+            logger.warning(
+                "Redis pool allows %d connections but concurrency=%d needs about %d; "
+                "raise max_connections to avoid MaxConnectionsError",
+                pool_size,
+                concurrency,
+                concurrency + _CONNECTIONS_OVERHEAD,
+            )
         self.queue = queue
         self.handlers = dict(handlers)
         self._wants_ctx = {name: _accepts_context(h) for name, h in self.handlers.items()}
