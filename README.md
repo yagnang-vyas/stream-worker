@@ -253,6 +253,14 @@ idempotency races) are the heart of the project.
 `python benchmarks/throughput.py` measures throughput on your own hardware. No numbers
 are quoted here because they would not transfer to your environment.
 
+## Web console (optional)
+
+A separate React frontend in [`frontend/`](frontend/README.md) provides an operations dashboard for the admin API
+(queue statistics, dead-letter inspection, confirmed requeue and purge) and a browser-only playground that simulates
+enqueueing, retries with backoff, worker crashes and recovery, idempotency and dead-letter handling. The playground is a
+simulation: it never touches Redis. The library, CLI and admin API do not depend on the console and need no Node.js.
+Build, test, API-key handling and reverse-proxy deployment are documented in [`frontend/README.md`](frontend/README.md).
+
 ## License
 
 MIT

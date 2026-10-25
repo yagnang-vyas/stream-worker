@@ -1,0 +1,36 @@
+# Static deploy of the StreamWorker console (frontend/). The Python package is not built here.
+# Default: playground-only. The dashboard needs an admin API; see the commented proxy rule
+# and frontend/README.md ("Netlify").
+[build]
+  base = "frontend"
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+# Optional same-origin proxy to ONE fixed, hosted admin API (HTTPS). Uncomment and replace the
+# host. Never put an API key here: operators type it into the console, which sends it as the
+# X-API-Key header, and Netlify forwards request headers to the upstream. Keep the destination
+# a single literal host; do not use a placeholder that lets callers pick the upstream.
+# Must come BEFORE the SPA fallback.
+#
+# [[redirects]]
+#   from = "/api/*"
+#   to = "https://streamworker-admin.example.com/:splat"
+#   status = 200
+#   force = true
+
+# SPA fallback (the app uses hash routing, so this only covers direct hits on unknown paths).
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"
+    X-Frame-Options = "DENY"
+    Content-Security-Policy = "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
