@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -35,6 +36,15 @@ class QueueStats:
 
     def to_dict(self) -> dict[str, int | None]:
         return asdict(self)
+
+
+_ENTRY_ID = re.compile(r"^\d+-\d+$")
+
+
+def _check_entry_id(entry_id: str) -> str:
+    if not _ENTRY_ID.match(entry_id):
+        raise ConfigError("invalid dead-letter entry id (expected e.g. 1700000000000-0)")
+    return entry_id
 
 
 def _ms(td: timedelta) -> int:
@@ -151,7 +161,7 @@ class Queue:
 
     async def dead_list(self, *, limit: int = 50, after: str | None = None) -> list[DeadJob]:
         """List dead-letter entries oldest first, optionally after an entry id."""
-        start = f"({after}" if after else "-"
+        start = f"({_check_entry_id(after)}" if after else "-"
         rows = cast(
             "list[tuple[str, dict[str, str]]]",
             await self.redis.xrange(self.keys.dead, min=start, max="+", count=limit),
@@ -171,14 +181,15 @@ class Queue:
         Returns the new stream entry id, or ``None`` if there is no such entry.
         """
         new_id: str | None = await self._requeue(
-            keys=[self.keys.dead, self.keys.stream], args=[entry_id, self._maxlen_arg]
+            keys=[self.keys.dead, self.keys.stream],
+            args=[_check_entry_id(entry_id), self._maxlen_arg],
         )
         return new_id
 
     async def dead_purge(self, entry_id: str | None = None) -> int:
         """Delete one dead entry, or all of them. Returns how many were deleted."""
         if entry_id is not None:
-            return int(await self.redis.xdel(self.keys.dead, entry_id))
+            return int(await self.redis.xdel(self.keys.dead, _check_entry_id(entry_id)))
         count = int(await self.redis.xlen(self.keys.dead))
         await self.redis.delete(self.keys.dead)
         return count

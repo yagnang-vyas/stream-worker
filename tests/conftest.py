@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import pytest
+import redis as syncredis
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
@@ -49,3 +50,23 @@ def queue_name() -> str:
 @pytest.fixture
 def queue(redis: Any, queue_name: str) -> Queue:
     return Queue(redis, queue_name)
+
+
+@pytest.fixture
+def sync_redis() -> Iterator[Any]:
+    """A synchronous client, for tests that call the (self-contained) CLI."""
+    client = syncredis.Redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        client.ping()
+    except (RedisError, OSError) as exc:
+        client.close()
+        message = f"Redis is unreachable at the configured REDIS_URL ({type(exc).__name__})."
+        if REQUIRE_REDIS:
+            pytest.fail(message)
+        pytest.skip(message)
+    client.flushdb()
+    try:
+        yield client
+    finally:
+        client.flushdb()
+        client.close()
