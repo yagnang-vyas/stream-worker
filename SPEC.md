@@ -100,8 +100,9 @@ Ambiguities resolved with the most conservative interpretation:
 
 1. **Group start id is `0`, not `$`.** Jobs enqueued before the first worker
    creates the group must not be lost.
-2. **`decode_responses=True` is required** on the Redis client; `Queue` raises
-   `ConfigError` otherwise. This keeps every code path on `str`.
+2. **`decode_responses=True` and RESP2 are required** on the Redis client (the
+   redis-py default protocol); `Queue` raises `ConfigError` otherwise. This keeps
+   every response shape and code path on `str`.
 3. **Delivery count is per stream entry.** A retry creates a new entry, so the
    poison counter measures consecutive crashes of one attempt, not failures.
 4. **`visibility_timeout` must exceed `handler_timeout`**, otherwise a healthy

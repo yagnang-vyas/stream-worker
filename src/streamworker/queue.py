@@ -19,6 +19,7 @@ from streamworker.serialization import DEFAULT_MAX_PAYLOAD_BYTES, dumps_payload
 
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_IDEMPOTENCY_TTL = timedelta(days=1)
+MAX_ERROR_MESSAGE_CHARS = 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +60,8 @@ class Queue:
         kwargs: dict[str, Any] = redis.get_connection_kwargs()  # type: ignore[no-untyped-call]
         if not kwargs.get("decode_responses"):
             raise ConfigError("the Redis client must be created with decode_responses=True")
+        if str(kwargs.get("protocol", 2)) != "2":
+            raise ConfigError("only the RESP2 protocol (the redis-py default) is supported")
         if max_len is not None and max_len < 1:
             raise ConfigError("max_len must be positive")
         if max_payload_bytes < 1:
@@ -179,3 +182,58 @@ class Queue:
         count = int(await self.redis.xlen(self.keys.dead))
         await self.redis.delete(self.keys.dead)
         return count
+
+    # -- worker-facing operations -------------------------------------------------
+
+    async def ensure_group(self) -> None:
+        """Create the consumer group (and stream) if missing."""
+        try:
+            await self.redis.xgroup_create(self.keys.stream, self.group, id="0", mkstream=True)
+        except ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    async def promote_due(self, limit: int = 100) -> int:
+        """Move up to ``limit`` due delayed jobs into the stream. Safe to run concurrently."""
+        moved: int = await self._promote(
+            keys=[self.keys.delayed, self.keys.stream, self.keys.dead],
+            args=[limit, self._maxlen_arg],
+        )
+        return moved
+
+    async def schedule_retry(self, entry_id: str, next_job: Job, delay: timedelta) -> bool:
+        """Atomically ack ``entry_id`` and schedule ``next_job`` after ``delay``.
+
+        Returns False (and does nothing) if the entry was no longer pending.
+        """
+        done: int = await self._retry(
+            keys=[self.keys.stream, self.keys.delayed],
+            args=[self.group, entry_id, _ms(delay), next_job.to_member()],
+        )
+        return bool(done)
+
+    async def move_to_dead(
+        self, entry_id: str, job_fields: dict[str, str], error_type: str, error_message: str
+    ) -> bool:
+        """Atomically ack ``entry_id`` and append the job plus error info to the dead stream.
+
+        Returns False (and does nothing) if the entry was no longer pending.
+        """
+        fields = {
+            **job_fields,
+            "error_type": error_type,
+            "error_message": error_message[:MAX_ERROR_MESSAGE_CHARS],
+            "failed_at": str(int(time.time() * 1000)),
+        }
+        args: list[str] = [self.group, entry_id]
+        for key, value in fields.items():
+            args += [key, value]
+        done: int = await self._dead(keys=[self.keys.stream, self.keys.dead], args=args)
+        return bool(done)
+
+    async def ack(self, entry_id: str) -> None:
+        """Acknowledge and delete a successfully processed entry."""
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.xack(self.keys.stream, self.group, entry_id)
+            pipe.xdel(self.keys.stream, entry_id)
+            await pipe.execute()
