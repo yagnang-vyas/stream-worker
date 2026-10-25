@@ -86,6 +86,19 @@ paths and hash routing, so it works from any sub-path or static host.
 npm run build   # -> frontend/dist
 ```
 
+### Netlify
+
+The root `netlify.toml` builds from `frontend/` (`npm run build`, publish `dist`, Node 22) with an SPA fallback and
+security headers. Out of the box this is a **playground-only** deploy: the Playground works, and the dashboard shows its
+disconnected state because there is no admin API to reach. No environment variables or secrets are needed.
+
+To use the dashboard from Netlify, host the admin API yourself over HTTPS and uncomment the `/api/*` redirect in
+`netlify.toml`, pointing it at that one literal host. Netlify then proxies same-origin (the admin API has no CORS), and
+the operator types the API key into System Connection with base URL `/api`. Rules: no API key in `netlify.toml` or build
+settings (it would be public or baked into assets); one fixed upstream only, never an open proxy; the admin API's shared
+key is its only authentication, so also restrict access (Netlify password protection or SSO, or an IP allow-list on the
+API). The CSP in `netlify.toml` allows `connect-src 'self'`, which fits the same-origin proxy.
+
 ## Limits
 
 * Redis persistence is whatever your Redis provides (use AOF if losing recent jobs matters); the console cannot change it.
