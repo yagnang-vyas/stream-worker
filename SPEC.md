@@ -49,13 +49,18 @@ a job in two places or in none.
 
 | Script | Effect |
 |---|---|
-| `enqueue` | optional `SET idem NX PX`, then `XADD` (or `ZADD` to delayed using server `TIME`). A duplicate key returns the original job id. |
-| `promote` | server `TIME`; `ZRANGEBYSCORE ... LIMIT`, `ZREM`, `XADD` for each due member. A `ZREM` and its `XADD` are in the same script, so concurrent promoters cannot duplicate a job. |
-| `retry` | `XACK` the original; only if that returned 1, `ZADD` the next attempt to delayed at `TIME + backoff`, then `XDEL`. |
-| `dead` | `XACK` the original; only if that returned 1, `XADD` to dead with error fields, then `XDEL`. |
-| `requeue` | read a dead entry, `XADD` it to the stream with `attempt=1`, `XDEL` it from dead. |
+| `enqueue` | return the existing id if the idempotency marker exists; else `XADD` (or `ZADD` to delayed using server `TIME`), then write the marker with `SET PX`. |
+| `promote` | server `TIME`; `ZRANGEBYSCORE ... LIMIT`; for each member `XADD` to the stream (or to dead if undecodable), *then* `ZREM`. The whole script is atomic, so concurrent promoters cannot duplicate a job. |
+| `retry` | if the entry is still in the PEL: `ZADD` the next attempt to delayed at `TIME + backoff`, then `XACK` + `XDEL` the original. |
+| `dead` | if the entry is still in the PEL: `XADD` to dead with error fields, then `XACK` + `XDEL`. |
+| `requeue` | read a dead entry, `XADD` it to the stream with `attempt=1`, then `XDEL` it from dead. |
 
-Gating on the `XACK` result makes retry/dead idempotent when two consumers race
+**Write ordering.** Redis does not roll back a script that fails part-way (for
+example on OOM). Each script therefore writes a job's new home before removing its
+old one, and the idempotency marker last. A mid-script failure can at worst duplicate
+a job, which at-least-once delivery allows, and can never lose one.
+
+Checking that the entry is still pending makes retry/dead idempotent when two consumers race
 for the same entry (for example after a slow handler was reclaimed).
 
 ## 5. State machine
@@ -100,8 +105,9 @@ Ambiguities resolved with the most conservative interpretation:
 
 1. **Group start id is `0`, not `$`.** Jobs enqueued before the first worker
    creates the group must not be lost.
-2. **`decode_responses=True` is required** on the Redis client; `Queue` raises
-   `ConfigError` otherwise. This keeps every code path on `str`.
+2. **`decode_responses=True` and RESP2 are required** on the Redis client (the
+   redis-py default protocol); `Queue` raises `ConfigError` otherwise. This keeps
+   every response shape and code path on `str`.
 3. **Delivery count is per stream entry.** A retry creates a new entry, so the
    poison counter measures consecutive crashes of one attempt, not failures.
 4. **`visibility_timeout` must exceed `handler_timeout`**, otherwise a healthy
@@ -125,3 +131,13 @@ Ambiguities resolved with the most conservative interpretation:
 12. **Idempotency keys expire** after `idempotency_ttl` (default 24 h); after
     that the same key enqueues a new job.
 13. **Worker does not close the Redis client**; the caller (or CLI) owns it.
+14. **`dead purge` and `dead requeue` require `--id` or `--all`** so a bare command
+    cannot delete or move everything.
+15. **Dead-letter entry ids are validated** (`<ms>-<seq>`) before use; invalid ids are
+    rejected with `ConfigError` (CLI exit 2, admin API 422).
+16. **A Redis pool smaller than `concurrency + 4`** logs a warning at `Worker` creation
+    (redis-py raises `MaxConnectionsError` when a non-blocking pool is exhausted).
+17. **Malformed delayed members** (undecodable JSON) are moved to the dead stream with
+    `error_type=MalformedJob` by the promoter rather than blocking promotion.
+18. **Retry/dead-letter only act on entries still in the PEL**, so a consumer that lost its
+    entry (reclaimed after a stall) cannot also reschedule it.
